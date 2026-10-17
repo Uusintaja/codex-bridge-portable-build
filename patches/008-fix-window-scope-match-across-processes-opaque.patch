@@ -1,0 +1,47 @@
+diff --git a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
+index e672d529..eafe283a 100644
+--- a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
++++ b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
+@@ -1,0 +2 @@
++  import BridgeIPC
+@@ -12,0 +14,5 @@
++    /// Opaque identity twin of `instanceScopeProperty`: the identity value
++    /// itself is the property value, so it can be compared from another
++    /// process without dereferencing memory that only exists in the owning
++    /// process.
++    static let instanceScopeIDProperty = "CodexBridgeInstanceScopeID"
+@@ -45 +51 @@
+-    /// Records the window's instance scope as a Win32 window property. The
++    /// Records the window's instance scope as Win32 window properties. The
+@@ -56,0 +63,5 @@
++      if let identity = instanceScopeID(forScope: scope) {
++        instanceScopeIDProperty.withCString(encodedAs: UTF16.self) { name in
++          _ = SetPropW(window, name, identity)
++        }
++      }
+@@ -59,5 +70,12 @@
+-    static func instanceScope(of window: HWND) -> String? {
+-      instanceScopeProperty.withCString(encodedAs: UTF16.self) { name in
+-        guard let raw = GetPropW(window, name) else { return nil }
+-        let pointer = UnsafePointer<UInt16>(raw.assumingMemoryBound(to: UInt16.self))
+-        return String(decodingCString: pointer, as: UTF16.self)
++    /// Opaque identity of an instance scope (shared FNV-1a hashing); only
++    /// equality comparisons of the returned value are meaningful.
++    static func instanceScopeID(forScope scope: String) -> UnsafeMutableRawPointer? {
++      guard let value = UInt(BridgeInstanceIdentifier.identifier(forScope: scope), radix: 16)
++      else { return nil }
++      return UnsafeMutableRawPointer(bitPattern: value)
++    }
++
++    /// Identity property of a window; safe to read across processes.
++    static func instanceScopeID(of window: HWND) -> UnsafeMutableRawPointer? {
++      instanceScopeIDProperty.withCString(encodedAs: UTF16.self) { name in
++        GetPropW(window, name)
+@@ -151 +169,6 @@
+-      return WindowsApplicationIdentity.instanceScope(of: window) == instanceScope
++      // The string property stores a pointer meaningful only inside the owning
++      // process; compare the opaque identity property instead.
++      guard
++        let identity = WindowsApplicationIdentity.instanceScopeID(forScope: instanceScope)
++      else { return false }
++      return WindowsApplicationIdentity.instanceScopeID(of: window) == identity

@@ -1,0 +1,7 @@
+diff --git a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
+index 6309acfa..13db74f9 100644
+--- a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
++++ b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
+@@ -88 +88 @@
+-    private static var comInitialized: Bool = false
++    nonisolated(unsafe) private static var comInitialized: Bool = false

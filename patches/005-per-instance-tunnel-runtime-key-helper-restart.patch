@@ -1,0 +1,165 @@
+diff --git a/Packages/BridgeCore/Sources/BridgeIPC/BridgeInstanceIdentifier.swift b/Packages/BridgeCore/Sources/BridgeIPC/BridgeInstanceIdentifier.swift
+new file mode 100644
+index 00000000..20f97f49
+--- /dev/null
++++ b/Packages/BridgeCore/Sources/BridgeIPC/BridgeInstanceIdentifier.swift
+@@ -0,0 +1,33 @@
++import Foundation
++
++/// Cross-platform instance scope identity: FNV-1a 64 over a normalized scope
++/// string (per-instance data root or explicit instance token), rendered as 16
++/// lowercase hex digits. Shared by the Windows pipe/mutex names and any
++/// subsystem that needs a stable per-instance identifier, such as
++/// per-instance secret references.
++public enum BridgeInstanceIdentifier {
++  public static func identifier(forScope scope: String) -> String {
++    let normalized = normalize(scope)
++    precondition(!normalized.isEmpty)
++    let hash = fnv1a64(normalized.utf8)
++    let suffix = String(hash, radix: 16).lowercased()
++    return String(repeating: "0", count: max(0, 16 - suffix.count)) + suffix
++  }
++
++  public static func normalize(_ value: String) -> String {
++    var normalized = value.replacingOccurrences(of: "/", with: "\\").lowercased()
++    while normalized.count > 3, normalized.hasSuffix("\\") {
++      normalized.removeLast()
++    }
++    return normalized
++  }
++
++  private static func fnv1a64<S: Sequence>(_ bytes: S) -> UInt64 where S.Element == UInt8 {
++    var hash: UInt64 = 14_695_981_039_346_656_037
++    for byte in bytes {
++      hash ^= UInt64(byte)
++      hash = hash &* 1_099_511_628_211
++    }
++    return hash
++  }
++}
+diff --git a/Packages/BridgeCore/Sources/BridgeIPC/WindowsPipeIdentity.swift b/Packages/BridgeCore/Sources/BridgeIPC/WindowsPipeIdentity.swift
+index 79408b1f..3a858fbb 100644
+--- a/Packages/BridgeCore/Sources/BridgeIPC/WindowsPipeIdentity.swift
++++ b/Packages/BridgeCore/Sources/BridgeIPC/WindowsPipeIdentity.swift
+@@ -46,0 +47,13 @@
++    /// Per-instance identifier (16 lowercase hex digits) for the current
++    /// process scope: explicit env scope when set, executable directory
++    /// otherwise. Same derivation as the pipe and mutex names.
++    public static func currentInstanceIdentifier() -> String {
++      if let root = instanceScope() {
++        return identifier(forScope: root)
++      }
++      guard let directory = currentExecutableDirectory() else {
++        fatalError("The current Windows executable directory is unavailable.")
++      }
++      return identifier(forExecutableDirectory: directory)
++    }
++
+@@ -71,8 +83,0 @@
+-    private static func normalize(_ directory: String) -> String {
+-      var value = directory.replacingOccurrences(of: "/", with: "\\").lowercased()
+-      while value.count > 3, value.hasSuffix("\\") {
+-        value.removeLast()
+-      }
+-      return value
+-    }
+-
+@@ -84,14 +89 @@
+-      let normalized = normalize(scope)
+-      precondition(!normalized.isEmpty)
+-      let hash = fnv1a64(normalized.utf8)
+-      let suffix = String(hash, radix: 16).lowercased()
+-      return String(repeating: "0", count: max(0, 16 - suffix.count)) + suffix
+-    }
+-
+-    private static func fnv1a64<S: Sequence>(_ bytes: S) -> UInt64 where S.Element == UInt8 {
+-      var hash: UInt64 = 14_695_981_039_346_656_037
+-      for byte in bytes {
+-        hash ^= UInt64(byte)
+-        hash = hash &* 1_099_511_628_211
+-      }
+-      return hash
++      BridgeInstanceIdentifier.identifier(forScope: scope)
+diff --git a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceComposition.swift b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceComposition.swift
+index f1226289..78758ee1 100644
+--- a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceComposition.swift
++++ b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceComposition.swift
+@@ -8,0 +9 @@ import BridgeDomain
++import BridgeIPC
+@@ -303,0 +305 @@ public actor ServiceComposition {
++      runtimeKeyReference: ServiceTunnelController.runtimeKeyReference(forDataRoot: paths.rootURL),
+diff --git a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceTunnelController+Configuration.swift b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceTunnelController+Configuration.swift
+index 2249fec5..ca947724 100644
+--- a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceTunnelController+Configuration.swift
++++ b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceTunnelController+Configuration.swift
+@@ -15 +15,2 @@ extension ServiceTunnelController {
+-    try await persist(tunnelID: tunnelID, runtimeKey: runtimeKey, enabled: true)
++    let configurationChanged = try await persist(
++      tunnelID: tunnelID, runtimeKey: runtimeKey, enabled: true)
+@@ -27,0 +29,5 @@ extension ServiceTunnelController {
++    if configurationChanged, try await currentManagerIsUsable() {
++      // A live helper still holds the previously persisted credentials; restart
++      // it so a changed tunnel ID or runtime key takes effect immediately.
++      await stopCurrent(publishStopped: false)
++    }
+@@ -60 +66 @@ extension ServiceTunnelController {
+-      try secretStore.remove(Self.runtimeKeyReference)
++      try secretStore.remove(runtimeKeyReference)
+@@ -157,0 +164,3 @@ extension ServiceTunnelController {
++  /// Persists the configuration; returns true when the stored tunnel ID or
++  /// runtime key actually changed (callers restart a live helper then).
++  @discardableResult
+@@ -162,2 +171,2 @@ extension ServiceTunnelController {
+-  ) async throws {
+-    let previousKey = try? secretStore.load(Self.runtimeKeyReference)
++  ) async throws -> Bool {
++    let previousKey = try? secretStore.load(runtimeKeyReference)
+@@ -167 +176 @@ extension ServiceTunnelController {
+-      try secretStore.store(runtimeKey, for: Self.runtimeKeyReference)
++      try secretStore.store(runtimeKey, for: runtimeKeyReference)
+@@ -172 +181 @@ extension ServiceTunnelController {
+-        try? secretStore.store(previousKey, for: Self.runtimeKeyReference)
++        try? secretStore.store(previousKey, for: runtimeKeyReference)
+@@ -174 +183 @@ extension ServiceTunnelController {
+-        try? secretStore.remove(Self.runtimeKeyReference)
++        try? secretStore.remove(runtimeKeyReference)
+@@ -179,0 +189 @@ extension ServiceTunnelController {
++    return previousKey != runtimeKey || previousID != tunnelID.rawValue
+@@ -183 +193 @@ extension ServiceTunnelController {
+-    guard let data = try? secretStore.load(Self.runtimeKeyReference),
++    guard let data = try? secretStore.load(runtimeKeyReference),
+diff --git a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceTunnelController.swift b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceTunnelController.swift
+index ed8ddee0..0efe8c73 100644
+--- a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceTunnelController.swift
++++ b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceTunnelController.swift
+@@ -0,0 +1 @@
++import BridgeIPC
+@@ -8,3 +9,10 @@ public actor ServiceTunnelController {
+-  public static let runtimeKeyReference = SecretReference(
+-    rawValue: "service.tunnel-runtime-key"
+-  )
++  /// Per-instance runtime key slot: the reference embeds the FNV-1a identity
++  /// of the instance data root, so N instances (one per orchestrator profile,
++  /// each with its own ChatGPT account) never overwrite each other's key.
++  public static func runtimeKeyReference(forDataRoot dataRoot: URL) -> SecretReference {
++    let scope = "dataroot:" + dataRoot.standardizedFileURL.path
++    return SecretReference(
++      rawValue: "service.tunnel-runtime-key."
++        + BridgeInstanceIdentifier.identifier(forScope: scope)
++    )
++  }
+@@ -14,0 +23 @@ public actor ServiceTunnelController {
++  let runtimeKeyReference: SecretReference
+@@ -34,0 +44 @@ public actor ServiceTunnelController {
++    runtimeKeyReference: SecretReference,
+@@ -42,0 +53 @@ public actor ServiceTunnelController {
++    self.runtimeKeyReference = runtimeKeyReference
+@@ -151 +162 @@ public actor ServiceTunnelController {
+-  private func currentManagerIsUsable() async throws -> Bool {
++  func currentManagerIsUsable() async throws -> Bool {
+@@ -233 +244 @@ public actor ServiceTunnelController {
+-      runtimeKeyReference: Self.runtimeKeyReference,
++      runtimeKeyReference: runtimeKeyReference,
+@@ -376 +387 @@ public actor ServiceTunnelController {
+-          runtimeKeyReference: Self.runtimeKeyReference,
++          runtimeKeyReference: runtimeKeyReference,

@@ -1,0 +1,52 @@
+diff --git a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceDeepSeekDesktopIdentity.swift b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceDeepSeekDesktopIdentity.swift
+index 87140a3b..fd84aacd 100644
+--- a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceDeepSeekDesktopIdentity.swift
++++ b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceDeepSeekDesktopIdentity.swift
+@@ -7,0 +8 @@ actor ServiceDeepSeekDesktopIdentity {
++  private let legacyReference: SecretReference?
+@@ -11,3 +12,4 @@ actor ServiceDeepSeekDesktopIdentity {
+-    let scope = SHA256.hash(data: Data(dataRoot.standardizedFileURL.path.utf8))
+-      .map { String(format: "%02x", $0) }.joined()
+-    reference = SecretReference(rawValue: "dsh-desktop-identity." + scope)
++    let path = dataRoot.standardizedFileURL.path
++    reference = Self.reference(forScope: Self.canonicalScope(for: path))
++    let legacy = Self.reference(forScope: path)
++    legacyReference = legacy == reference ? nil : legacy
+@@ -16,0 +19,15 @@ actor ServiceDeepSeekDesktopIdentity {
++    if let bytes = try loadValidated(reference) {
++      return bytes
++    }
++    if let legacyReference, let bytes = try loadValidated(legacyReference) {
++      // One-time migration: copy into the canonical slot but keep the legacy
++      // entry so a rollback to an older build still finds its identity.
++      try? store.store(bytes, for: reference)
++      return bytes
++    }
++    let key = Curve25519.Signing.PrivateKey()
++    try store.store(key.rawRepresentation, for: reference)
++    return key.rawRepresentation
++  }
++
++  private func loadValidated(_ reference: SecretReference) throws -> Data? {
+@@ -22,3 +39 @@ actor ServiceDeepSeekDesktopIdentity {
+-      let key = Curve25519.Signing.PrivateKey()
+-      try store.store(key.rawRepresentation, for: reference)
+-      return key.rawRepresentation
++      return nil
+@@ -26,0 +42,16 @@ actor ServiceDeepSeekDesktopIdentity {
++
++  private static func canonicalScope(for path: String) -> String {
++    #if os(Windows)
++      // The same directory can be spelled with different case or separators;
++      // normalize so every spelling resolves to one desktop identity.
++      return path.replacingOccurrences(of: "/", with: "\\").lowercased()
++    #else
++      return path
++    #endif
++  }
++
++  private static func reference(forScope scope: String) -> SecretReference {
++    let digest = SHA256.hash(data: Data(scope.utf8))
++      .map { String(format: "%02x", $0) }.joined()
++    return SecretReference(rawValue: "dsh-desktop-identity." + digest)
++  }

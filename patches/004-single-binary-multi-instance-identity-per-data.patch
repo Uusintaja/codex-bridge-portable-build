@@ -1,0 +1,90 @@
+diff --git a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
+index d697ec96..fae2a15b 100644
+--- a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
++++ b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
+@@ -112 +112,3 @@
+-    /// Portable-scoped single-instance name (FNV-1a of exe directory).
++    /// Instance-scoped single-instance name. Prefers the orchestrator-assigned
++    /// data-root (one per profile) so a single binary directory can host N
++    /// isolated Apps; falls back to the exe directory (legacy single copy).
+@@ -114 +116,7 @@
+-      guard let path = currentExecutablePath(),
++      let env = ProcessInfo.processInfo.environment
++      let scope: String
++      if let root = env["CODEX_BRIDGE_DATA_ROOT"], !root.isEmpty {
++        scope = "dataroot:" + root
++      } else if let inst = env["CODEX_BRIDGE_INSTANCE"], !inst.isEmpty {
++        scope = "instance:" + inst
++      } else if let path = currentExecutablePath(),
+@@ -116 +124,3 @@
+-      else {
++      {
++        scope = String(path[..<sep])
++      } else {
+@@ -119 +129 @@
+-      let directory = String(path[..<sep]).lowercased().replacingOccurrences(
++      let directory = scope.lowercased().replacingOccurrences(
+diff --git a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsWebViewThread+Platform.swift b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsWebViewThread+Platform.swift
+index 11700d1b..9dd0dfc3 100644
+--- a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsWebViewThread+Platform.swift
++++ b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsWebViewThread+Platform.swift
+@@ -86,0 +87,9 @@
++      // Multi-instance rule: prefer the orchestrator-assigned data-root so
++      // each profile (e.g. different ChatGPT logins) gets its own EBWebView
++      // cookies. Falls back to LOCALAPPDATA (legacy single copy).
++      let env = ProcessInfo.processInfo.environment
++      if let root = env["CODEX_BRIDGE_DATA_ROOT"], !root.isEmpty {
++        var base = root.replacingOccurrences(of: "/", with: "\\")
++        while base.count > 3, base.hasSuffix("\\") { base.removeLast() }
++        return base + "\\WebView2\\" + profileName
++      }
+diff --git a/Packages/BridgeCore/Sources/BridgeIPC/WindowsPipeIdentity.swift b/Packages/BridgeCore/Sources/BridgeIPC/WindowsPipeIdentity.swift
+index 2c2d1666..79408b1f 100644
+--- a/Packages/BridgeCore/Sources/BridgeIPC/WindowsPipeIdentity.swift
++++ b/Packages/BridgeCore/Sources/BridgeIPC/WindowsPipeIdentity.swift
+@@ -5,3 +5,5 @@
+-  /// Derives a stable, installation-scoped named-pipe endpoint from the
+-  /// executable directory. The service and shell in one directory therefore
+-  /// share an endpoint while separate portable copies do not.
++  /// Derives a stable endpoint. Multi-instance rule (generic, no vendor
++  /// binding): when `CODEX_BRIDGE_DATA_ROOT` is set (one per orchestrator
++  /// profile), identity hashes the data-root so a single binary directory can
++  /// host N isolated instances. Otherwise falls back to the executable
++  /// directory (legacy single-copy behaviour, unchanged).
+@@ -9,0 +12,3 @@
++      if let root = instanceScope() {
++        return pipeName(forScope: root)
++      }
+@@ -16,0 +22,3 @@
++      if let root = instanceScope() {
++        return mutexName(forScope: root)
++      }
+@@ -30,0 +39,21 @@
++    public static func pipeName(forScope scope: String) -> String {
++      "\\\\.\\pipe\\org.codexbridge.service.\(identifier(forScope: scope))"
++    }
++
++    public static func mutexName(forScope scope: String) -> String {
++      "Global\\org.codexbridge.service.\(identifier(forScope: scope))"
++    }
++
++    /// Per-instance scope: explicit data-root wins (shim sets one per
++    /// profile); CODEX_BRIDGE_INSTANCE alone also scopes when set.
++    private static func instanceScope() -> String? {
++      let env = ProcessInfo.processInfo.environment
++      if let root = env["CODEX_BRIDGE_DATA_ROOT"], !root.isEmpty {
++        return "dataroot:" + root
++      }
++      if let inst = env["CODEX_BRIDGE_INSTANCE"], !inst.isEmpty {
++        return "instance:" + inst
++      }
++      return nil
++    }
++
+@@ -51 +80,5 @@
+-      let normalized = normalize(directory)
++      identifier(forScope: directory)
++    }
++
++    private static func identifier(forScope scope: String) -> String {
++      let normalized = normalize(scope)

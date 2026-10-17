@@ -1,0 +1,479 @@
+diff --git a/Packages/BridgeCore/Sources/BridgeAgentCore/ToolDiscoveryEnvironment.swift b/Packages/BridgeCore/Sources/BridgeAgentCore/ToolDiscoveryEnvironment.swift
+index 3656f012..478a1dbc 100644
+--- a/Packages/BridgeCore/Sources/BridgeAgentCore/ToolDiscoveryEnvironment.swift
++++ b/Packages/BridgeCore/Sources/BridgeAgentCore/ToolDiscoveryEnvironment.swift
+@@ -11,0 +12,6 @@ import Foundation
++///
++/// Portable mode (generic, no vendor binding):
++/// when `CODEX_BRIDGE_ISOLATED=1`, host registry PATH merge is skipped and only
++/// explicit `CODEX_BRIDGE_*` overrides plus agent home vars from the process
++/// environment are honoured. The shim/GUI computes absolute paths (any portable
++/// layout) and passes them via these generic variables.
+@@ -12,0 +19,6 @@ public enum ToolDiscoveryEnvironment {
++  /// Generic isolation switch, set by any portable shim.
++  public static var isIsolated: Bool {
++    let env = ProcessInfo.processInfo.environment
++    return env.first(where: { $0.key.caseInsensitiveCompare("CODEX_BRIDGE_ISOLATED") == .orderedSame })?.value == "1"
++  }
++
+@@ -17,7 +29,12 @@ public enum ToolDiscoveryEnvironment {
+-      let path = [
+-        registeredValue("Path", root: HKEY_LOCAL_MACHINE, subkey: machineKey),
+-        registeredValue("Path", root: HKEY_CURRENT_USER, subkey: "Environment"),
+-        environment.first(where: { $0.key.caseInsensitiveCompare("PATH") == .orderedSame })?.value,
+-      ].compactMap { $0 }.filter { !$0.isEmpty }
+-      environment = environment.filter { $0.key.caseInsensitiveCompare("PATH") != .orderedSame }
+-      environment["PATH"] = path.joined(separator: ";")
++      if isIsolated {
++        // Portable fenced mode: keep the shim's PATH as-is so host installs
++        // cannot punch through. Explicit overrides below still apply.
++      } else {
++        let path = [
++          registeredValue("Path", root: HKEY_LOCAL_MACHINE, subkey: machineKey),
++          registeredValue("Path", root: HKEY_CURRENT_USER, subkey: "Environment"),
++          environment.first(where: { $0.key.caseInsensitiveCompare("PATH") == .orderedSame })?.value,
++        ].compactMap { $0 }.filter { !$0.isEmpty }
++        environment = environment.filter { $0.key.caseInsensitiveCompare("PATH") != .orderedSame }
++        environment["PATH"] = path.joined(separator: ";")
++      }
+@@ -27,0 +45 @@ public enum ToolDiscoveryEnvironment {
++        // Generic explicit executable overrides (highest priority, shim/GUI set).
+@@ -28,0 +47,19 @@ public enum ToolDiscoveryEnvironment {
++        "CODEX_BRIDGE_OPENCODE_EXECUTABLE",
++        "CODEX_BRIDGE_PI_EXECUTABLE",
++        "CODEX_BRIDGE_QODER_EXECUTABLE",
++        "CODEX_BRIDGE_AGY_EXECUTABLE",
++        "CODEX_BRIDGE_ANTIGRAVITY_EXECUTABLE",
++        "CODEX_BRIDGE_CLAUDE_EXECUTABLE",
++        "CODEX_BRIDGE_DSH_EXECUTABLE",
++        "CODEX_BRIDGE_DSH_HOME",
++        "CODEX_BRIDGE_DSH_NODE",
++        "CODEX_BRIDGE_DATA_ROOT",
++        "CODEX_BRIDGE_ISOLATED",
++        // Generic agent home overrides (data-isolation friendly, vendor docs).
++        "CODEX_HOME", "CODEX_SQLITE_HOME",
++        "CLAUDE_CONFIG_DIR",
++        "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR",
++        "OPENCODE_CONFIG_DIR", "OPENCODE_DATA_DIR", "OPENCODE_CACHE_DIR",
++        "OPENCODE_LOG_DIR", "OPENCODE_STATE_DIR", "OPENCODE_APPNAME",
++        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
++        "DSH_HOME",
+@@ -32,0 +70,10 @@ public enum ToolDiscoveryEnvironment {
++        // Shim/GUI values always win: only fill from registry when the process
++        // environment does not already carry the key.
++        if environment.first(where: { $0.key.caseInsensitiveCompare(name) == .orderedSame }) != nil {
++          continue
++        }
++        // In isolated mode never let host registry reintroduce host paths,
++        // except for explicit bridge overrides.
++        if isIsolated, !name.hasPrefix("CODEX_BRIDGE_"), !name.hasPrefix("DEEPSEEK_HARNESS_") {
++          continue
++        }
+diff --git a/Packages/BridgeCore/Sources/BridgeDeepSeekHarnessACP/DeepSeekHarnessACPLaunchEnvironment.swift b/Packages/BridgeCore/Sources/BridgeDeepSeekHarnessACP/DeepSeekHarnessACPLaunchEnvironment.swift
+index 187e99f2..f1e5d324 100644
+--- a/Packages/BridgeCore/Sources/BridgeDeepSeekHarnessACP/DeepSeekHarnessACPLaunchEnvironment.swift
++++ b/Packages/BridgeCore/Sources/BridgeDeepSeekHarnessACP/DeepSeekHarnessACPLaunchEnvironment.swift
+@@ -19 +19,14 @@ extension DeepSeekHarnessACPLaunchBuilder {
+-    let dshHome = try DeepSeekHarnessACPPathSupport.append("dsh-home", to: runDirectory)
++    // Generic data-isolation: when the shim/GUI pins DSH_HOME (any vendor
++    // layout), reuse it so sessions/providers persist in the portable package.
++    // Otherwise keep the isolated per-run dsh-home.
++    let dshHome: String
++    if let override = sourceEnvironment["DSH_HOME"] ?? sourceEnvironment["CODEX_BRIDGE_DSH_HOME"],
++      !override.isEmpty,
++      override.rangeOfCharacter(from: .controlCharacters) == nil,
++      !override.contains("\0")
++    {
++      try DeepSeekHarnessACPPathSupport.createPrivateDirectory(override)
++      dshHome = override
++    } else {
++      dshHome = try DeepSeekHarnessACPPathSupport.append("dsh-home", to: runDirectory)
++    }
+diff --git a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
+index b768afa9..d697ec96 100644
+--- a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
++++ b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsApplicationControl.swift
+@@ -16,0 +17,3 @@
++    /// Portable fix: scope the single-instance mutex to the executable directory
++    /// (same FNV-1a hashing as WindowsPipeIdentity) so two portable copies can
++    /// run side by side without stealing each other's window.
+@@ -18 +21 @@
+-      let mutexName = "Local\\CodexBridge.WindowsApp.SingleInstance"
++      let mutexName = singleInstanceMutexName()
+@@ -85,0 +89,2 @@
++      // Only activate a window owned by this portable copy.
++      let expected = currentExecutablePath()
+@@ -87 +92 @@
+-        if let window = findMainWindow() {
++        if let window = findMainWindow(for: expected) {
+@@ -106,0 +112,19 @@
++    /// Portable-scoped single-instance name (FNV-1a of exe directory).
++    private static func singleInstanceMutexName() -> String {
++      guard let path = currentExecutablePath(),
++        let sep = path.lastIndex(of: "\\")
++      else {
++        return "Local\\CodexBridge.WindowsApp.SingleInstance"
++      }
++      let directory = String(path[..<sep]).lowercased().replacingOccurrences(
++        of: "/", with: "\\")
++      var hash: UInt64 = 14_695_981_039_346_656_037
++      for byte in directory.utf8 {
++        hash ^= UInt64(byte)
++        hash = hash &* 1_099_511_628_211
++      }
++      let suffix = String(hash, radix: 16).lowercased()
++      let padded = String(repeating: "0", count: max(0, 16 - suffix.count)) + suffix
++      return "Local\\CodexBridge.WindowsApp.SingleInstance.\(padded)"
++    }
++
+diff --git a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
+index 538dfcba..6309acfa 100644
+--- a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
++++ b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
+@@ -46 +46,3 @@
+-      var fileName = [WCHAR](repeating: 0, count: Int(MAX_PATH))
++      // Long-path safe: 32k buffer instead of MAX_PATH 260.
++      let bufferCount = 32_768
++      var fileName = [WCHAR](repeating: 0, count: bufferCount)
+@@ -62 +64 @@
+-            ofn.nMaxFile = DWORD(MAX_PATH)
++            ofn.nMaxFile = DWORD(bufferCount)
+@@ -71,0 +74,2 @@
++    // MARK: - Project directory picker (modern IFileOpenDialog + legacy fallback)
++
+@@ -73 +77,71 @@
+-      var displayName = [WCHAR](repeating: 0, count: Int(MAX_PATH))
++      ensureUIThreadCOM()
++      if let modern = chooseDirectoryModern() {
++        return modern
++      }
++      return chooseDirectoryLegacy()
++    }
++
++    /// Ensures the Win32 UI thread is STA-initialized for Shell dialogs.
++    /// The UI pump in WindowsUIThread.run() never called CoInitializeEx, so the
++    /// first SHBrowseForFolder/IFileDialog here would return CO_E_NOTINITIALIZED
++    /// or an empty tree. Kept for process lifetime on purpose.
++    private static var comInitialized: Bool = false
++    private static func ensureUIThreadCOM() {
++      guard !comInitialized else { return }
++      // COINIT_APARTMENTTHREADED = 0x2. S_OK = 0, S_FALSE = 1.
++      let hr = CoInitializeEx(nil, DWORD(0x2))
++      if hr == 0 || hr == 1 {
++        comInitialized = true
++      } else {
++        _ = OleInitialize(nil)
++        comInitialized = true
++      }
++    }
++
++    /// Modern picker: IFileOpenDialog with FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM.
++    /// Supports long paths, search box, breadcrumb, and redirected profiles.
++    /// Returns nil on cancel or failure (falls back to legacy).
++    private static func chooseDirectoryModern() -> String? {
++      let title = "Select the project directory to register with Codex Bridge"
++      var dialog: UnsafeMutableRawPointer?
++      var clsid = makeFolderPickerGUID(
++        0xDC1C_5A9C, 0xE88A, 0x4DDE,
++        (0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7)
++      )
++      var iid = makeFolderPickerGUID(
++        0xD57C_7288, 0xD4AD, 0x4768,
++        (0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60)
++      )
++      // CLSCTX_INPROC_SERVER = 1
++      let hrCreate = CoCreateInstance(&clsid, nil, DWORD(1), &iid, &dialog)
++      guard hrCreate == 0, let dialog else { return nil }
++      defer { folderPickerRelease(dialog) }
++
++      // FOS_PICKFOLDERS(0x20) | FOS_FORCEFILESYSTEM(0x40) | FOS_NOCHANGEDIR(0x08)
++      // | FOS_DONTADDTORECENT(0x02000000)
++      let options: DWORD = DWORD(0x20) | DWORD(0x40) | DWORD(0x08) | DWORD(0x0200_0000)
++      _ = folderPickerSetOptions(dialog, options)
++      title.withCString(encodedAs: UTF16.self) { titlePointer in
++        _ = folderPickerSetTitle(dialog, titlePointer)
++      }
++      if let initialDir = portableInitialDirectory(),
++        let item = shellItemFromPath(initialDir)
++      {
++        _ = folderPickerSetDefaultFolder(dialog, item)
++        folderPickerRelease(item)
++      }
++
++      let owner = WindowsMainWindow.currentWindow()
++      let hrShow = folderPickerShow(dialog, owner)
++      guard hrShow == 0 else { return nil }
++      var result: UnsafeMutableRawPointer?
++      guard folderPickerGetResult(dialog, &result) == 0, let result else { return nil }
++      defer { folderPickerRelease(result) }
++      return shellItemFilePath(result)
++    }
++
++    /// Legacy fallback: SHBrowseForFolderW with 32k buffer.
++    /// Only reached when IFileDialog is unavailable (very old shell).
++    private static func chooseDirectoryLegacy() -> String? {
++      let bufferCount = 32_768
++      var displayName = [WCHAR](repeating: 0, count: bufferCount)
+@@ -87 +161 @@
+-      var path = [WCHAR](repeating: 0, count: Int(MAX_PATH))
++      var path = [WCHAR](repeating: 0, count: bufferCount)
+@@ -93 +167,119 @@
+-      return String(decoding: path.prefix { $0 != 0 }, as: UTF16.self)
++      let result = String(decoding: path.prefix { $0 != 0 }, as: UTF16.self)
++      return result.isEmpty ? nil : result
++    }
++
++    /// Portable-aware initial directory: prefers the redirected USERPROFILE so
++    /// the dialog never opens into an empty room. Falls back to nil (shell
++    /// default) when unavailable.
++    private static func portableInitialDirectory() -> String? {
++      let env = ProcessInfo.processInfo.environment
++      let redirected = env["USERPROFILE"] ?? env["UserProfile"]
++      if let redirected, !redirected.isEmpty,
++        FileManager.default.fileExists(atPath: redirected)
++      {
++        return redirected
++      }
++      return nil
++    }
++
++    // MARK: - Minimal IFileDialog COM helpers (same vtable style as WebView2 ABI)
++
++    private static func makeFolderPickerGUID(
++      _ data1: UInt32,
++      _ data2: UInt16,
++      _ data3: UInt16,
++      _ data4: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)
++    ) -> GUID {
++      var guid = GUID()
++      guid.Data1 = data1
++      guid.Data2 = data2
++      guid.Data3 = data3
++      guid.Data4 = data4
++      return guid
++    }
++
++    private static func folderPickerMethod<F>(
++      _ object: UnsafeMutableRawPointer, _ slot: Int, as type: F.Type
++    ) -> F {
++      let vtable = UnsafeRawPointer(object).load(as: UnsafeRawPointer.self)
++      return vtable.load(fromByteOffset: slot * MemoryLayout<UnsafeRawPointer>.size, as: F.self)
++    }
++
++    private static func folderPickerRelease(_ object: UnsafeMutableRawPointer) {
++      typealias ReleaseFn = @convention(c) (UnsafeMutableRawPointer?) -> UInt32
++      let release: ReleaseFn = folderPickerMethod(object, 2, as: ReleaseFn.self)
++      _ = release(object)
++    }
++
++    private static func folderPickerSetOptions(_ object: UnsafeMutableRawPointer, _ options: DWORD)
++      -> HRESULT
++    {
++      typealias SetOptionsFn = @convention(c) (UnsafeMutableRawPointer?, DWORD) -> HRESULT
++      let fn: SetOptionsFn = folderPickerMethod(object, 9, as: SetOptionsFn.self)
++      return fn(object, options)
++    }
++
++    private static func folderPickerSetTitle(
++      _ object: UnsafeMutableRawPointer, _ title: UnsafePointer<WCHAR>?
++    ) -> HRESULT {
++      typealias SetTitleFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<WCHAR>?)
++        -> HRESULT
++      let fn: SetTitleFn = folderPickerMethod(object, 17, as: SetTitleFn.self)
++      return fn(object, title)
++    }
++
++    private static func folderPickerSetDefaultFolder(
++      _ object: UnsafeMutableRawPointer, _ folder: UnsafeMutableRawPointer?
++    ) -> HRESULT {
++      typealias SetFolderFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?)
++        -> HRESULT
++      let fn: SetFolderFn = folderPickerMethod(object, 11, as: SetFolderFn.self)
++      return fn(object, folder)
++    }
++
++    private static func folderPickerShow(_ object: UnsafeMutableRawPointer, _ owner: HWND?)
++      -> HRESULT
++    {
++      typealias ShowFn = @convention(c) (UnsafeMutableRawPointer?, HWND?) -> HRESULT
++      let fn: ShowFn = folderPickerMethod(object, 3, as: ShowFn.self)
++      return fn(object, owner)
++    }
++
++    private static func folderPickerGetResult(
++      _ object: UnsafeMutableRawPointer, _ out: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
++    ) -> HRESULT {
++      typealias GetResultFn = @convention(c) (
++        UnsafeMutableRawPointer?, UnsafeMutablePointer<UnsafeMutableRawPointer?>?
++      ) -> HRESULT
++      let fn: GetResultFn = folderPickerMethod(object, 20, as: GetResultFn.self)
++      return fn(object, out)
++    }
++
++    private static func shellItemFromPath(_ path: String) -> UnsafeMutableRawPointer? {
++      // SHCreateItemFromParsingName(path, nil, IID_IShellItem, &item)
++      var iid = makeFolderPickerGUID(
++        0x4382_6D1E, 0xE718, 0x42EE,
++        (0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B, 0xFE)
++      )
++      var item: UnsafeMutableRawPointer?
++      let hr = path.withCString(encodedAs: UTF16.self) { ptr in
++        SHCreateItemFromParsingName(ptr, nil, &iid, &item)
++      }
++      guard hr == 0 else { return nil }
++      return item
++    }
++
++    private static func shellItemFilePath(_ item: UnsafeMutableRawPointer) -> String? {
++      // IShellItem.GetDisplayName slot 5, SIGDN_FILESYSPATH = 0x80058000
++      typealias GetDisplayNameFn = @convention(c) (
++        UnsafeMutableRawPointer?, DWORD, UnsafeMutablePointer<UnsafeMutablePointer<WCHAR>?>?
++      ) -> HRESULT
++      let fn: GetDisplayNameFn = folderPickerMethod(item, 5, as: GetDisplayNameFn.self)
++      var name: UnsafeMutablePointer<WCHAR>?
++      guard fn(item, DWORD(0x8005_8000), &name) == 0, let name else { return nil }
++      defer { CoTaskMemFree(name) }
++      var length = 0
++      while name[length] != 0 { length += 1 }
++      let buffer = UnsafeBufferPointer(start: name, count: length)
++      let result = String(decoding: buffer, as: UTF16.self)
++      return result.isEmpty ? nil : result
+diff --git a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsServiceLauncher.swift b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsServiceLauncher.swift
+index 41761696..a0514019 100644
+--- a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsServiceLauncher.swift
++++ b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsServiceLauncher.swift
+@@ -73,3 +73,3 @@
+-    /// Path of the bootstrap log the service's stderr is redirected to. The
+-    /// directory matches `ServiceDataPaths.defaultRoot()` so the service and
+-    /// the shell agree on where startup diagnostics live.
++    /// Path of the bootstrap log. Portable fix: prefer
++    /// <exe-dir>/codex-bridge-data/service/Logs when that tree exists (or
++    /// CODEX_BRIDGE_DATA_ROOT is set), so two copies never share %APPDATA%.
+@@ -76,0 +77 @@
++      if let portable = portableBootstrapLogURL() { return portable }
+@@ -88,0 +90,33 @@
++    /// Portable data-root for this copy: <exe-dir>/codex-bridge-data/service.
++    static func portableDataRoot() -> String? {
++      let env = ProcessInfo.processInfo.environment
++      if let configured = env["CODEX_BRIDGE_DATA_ROOT"], !configured.isEmpty {
++        return configured
++      }
++      guard let exe = serviceExecutablePath(),
++        let sep = exe.lastIndex(of: "\\")
++      else { return nil }
++      let dir = String(exe[..<sep])
++      let candidate = dir + "\\codex-bridge-data\\service"
++      var isDir: ObjCBool = false
++      if FileManager.default.fileExists(atPath: candidate, isDirectory: &isDir),
++        isDir.boolValue
++      {
++        return candidate
++      }
++      let parent = dir + "\\codex-bridge-data"
++      if FileManager.default.fileExists(atPath: parent, isDirectory: &isDir),
++        isDir.boolValue
++      {
++        return candidate
++      }
++      return nil
++    }
++
++    private static func portableBootstrapLogURL() -> URL? {
++      guard let root = portableDataRoot() else { return nil }
++      return URL(fileURLWithPath: root, isDirectory: true)
++        .appending(path: "Logs", directoryHint: .isDirectory)
++        .appending(path: "service-bootstrap.log")
++    }
++
+@@ -98 +132,9 @@
+-      var commandLine = Array("\"\(executablePath)\"".utf16) + [WCHAR(0)]
++      // Portable fix: relaunch with the same --data-root the shim uses.
++      let dataRoot = portableDataRoot()
++      let commandText: String
++      if let dataRoot {
++        commandText = "\"\(executablePath)\" --data-root \"\(dataRoot)\""
++      } else {
++        commandText = "\"\(executablePath)\""
++      }
++      var commandLine = Array(commandText.utf16) + [WCHAR(0)]
+diff --git a/Packages/BridgeCore/Sources/BridgeOpenCodeACP/OpenCodeACPProfile.swift b/Packages/BridgeCore/Sources/BridgeOpenCodeACP/OpenCodeACPProfile.swift
+index 66cbfe68..49ebf102 100644
+--- a/Packages/BridgeCore/Sources/BridgeOpenCodeACP/OpenCodeACPProfile.swift
++++ b/Packages/BridgeCore/Sources/BridgeOpenCodeACP/OpenCodeACPProfile.swift
+@@ -210,0 +211,13 @@ public struct OpenCodeACPLaunchBuilder: Sendable {
++    // Generic portable overrides (any vendor layout): newer opencode honours
++    // OPENCODE_*_DIR / OPENCODE_APPNAME over XDG. Pass through when pinned.
++    for key in [
++      "OPENCODE_CONFIG_DIR", "OPENCODE_DATA_DIR", "OPENCODE_CACHE_DIR",
++      "OPENCODE_LOG_DIR", "OPENCODE_STATE_DIR", "OPENCODE_APPNAME",
++      "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT",
++    ] {
++      if let value = source[key], !value.isEmpty, !value.contains("\0"),
++        value.rangeOfCharacter(from: .controlCharacters) == nil
++      {
++        environment[key] = value
++      }
++    }
+diff --git a/Packages/BridgeCore/Sources/BridgePiRPC/PiRuntimeProfile.swift b/Packages/BridgeCore/Sources/BridgePiRPC/PiRuntimeProfile.swift
+index 53e9373b..017854ff 100644
+--- a/Packages/BridgeCore/Sources/BridgePiRPC/PiRuntimeProfile.swift
++++ b/Packages/BridgeCore/Sources/BridgePiRPC/PiRuntimeProfile.swift
+@@ -155 +155,2 @@ struct PiRuntimeProfile: Sendable {
+-      "PI_CODING_AGENT_DIR",
++      "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR",
++      "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY", "PI_CACHE_RETENTION",
+diff --git a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceAgentAutoDiscovery.swift b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceAgentAutoDiscovery.swift
+index 34e5cb51..a249b591 100644
+--- a/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceAgentAutoDiscovery.swift
++++ b/Packages/BridgeCore/Sources/BridgeServiceHost/ServiceAgentAutoDiscovery.swift
+@@ -27,0 +28,8 @@ enum ServiceAgentAutoDiscovery {
++    // Generic explicit overrides (shim/GUI computed, vendor-agnostic).
++    // Highest priority; isolated mode additionally skips all host search.
++    existingPaths.insert(
++      contentsOf: explicitExecutableCandidates(
++        providerID: providerID, environment: environment),
++      at: 0)
++    let isolated = ToolDiscoveryEnvironment.isIsolated
++    let allowSearch = (!isolated) && (discoveredExecutablePath == nil)
+@@ -32 +40 @@ enum ServiceAgentAutoDiscovery {
+-        allowInstallationSearch: discoveredExecutablePath == nil,
++        allowInstallationSearch: allowSearch,
+@@ -45 +53 @@ enum ServiceAgentAutoDiscovery {
+-        allowInstallationSearch: discoveredExecutablePath == nil
++        allowInstallationSearch: allowSearch
+@@ -56 +64 @@ enum ServiceAgentAutoDiscovery {
+-        allowInstallationSearch: discoveredExecutablePath == nil
++        allowInstallationSearch: allowSearch
+@@ -67 +75 @@ enum ServiceAgentAutoDiscovery {
+-        allowInstallationSearch: discoveredExecutablePath == nil
++        allowInstallationSearch: allowSearch
+@@ -72,0 +81,6 @@ enum ServiceAgentAutoDiscovery {
++      } else if environmentValue("CODEX_BRIDGE_DEEPSEEK_HARNESS_EXECUTABLE", environment: environment) == nil,
++        let generic = environmentValue("CODEX_BRIDGE_DSH_EXECUTABLE", environment: environment)
++      {
++        // Generic alias -> legacy DSH key (existing deepSeekExecutableCandidates
++        // already honours the legacy key).
++        environment["CODEX_BRIDGE_DEEPSEEK_HARNESS_EXECUTABLE"] = generic
+@@ -310,0 +325,22 @@ enum ServiceAgentAutoDiscovery {
++
++  /// Generic explicit executable lookup. Shim/GUI sets one absolute path per
++  /// provider (any portable layout); core never inspects installer layouts.
++  static func explicitExecutableCandidates(
++    providerID: AgentProviderID,
++    environment: [String: String]
++  ) -> [String] {
++    let key: String
++    switch providerID {
++    case .openCode: key = "CODEX_BRIDGE_OPENCODE_EXECUTABLE"
++    case .pi: key = "CODEX_BRIDGE_PI_EXECUTABLE"
++    case .qoder: key = "CODEX_BRIDGE_QODER_EXECUTABLE"
++    case .antigravity: key = "CODEX_BRIDGE_AGY_EXECUTABLE"
++    case .deepSeekHarness: key = "CODEX_BRIDGE_DSH_EXECUTABLE"
++    case .codex: key = "CODEX_BRIDGE_CODEX_EXECUTABLE"
++    default: return []
++    }
++    guard let v = environmentValue(key, environment: environment), !v.isEmpty else {
++      return []
++    }
++    return [v]
++  }

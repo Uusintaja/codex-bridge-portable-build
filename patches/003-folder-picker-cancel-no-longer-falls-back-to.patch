@@ -1,0 +1,44 @@
+diff --git a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
+index 13db74f9..3d072a7c 100644
+--- a/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
++++ b/Packages/BridgeCore/Sources/BridgeDesktopShell/WindowsDesktopUIHostActions.swift
+@@ -78,2 +78,9 @@
+-      if let modern = chooseDirectoryModern() {
+-        return modern
++      switch chooseDirectoryModern() {
++      case .selected(let path):
++        return path
++      case .cancelled:
++        // User pressed Cancel/Esc: terminal, must NOT fall back to legacy
++        // (legacy would pop a second dialog behind the first).
++        return nil
++      case .failed:
++        return chooseDirectoryLegacy()
+@@ -81 +88,6 @@
+-      return chooseDirectoryLegacy()
++    }
++
++    private enum FolderPickerOutcome {
++      case selected(String)
++      case cancelled
++      case failed
+@@ -103,2 +115,2 @@
+-    /// Returns nil on cancel or failure (falls back to legacy).
+-    private static func chooseDirectoryModern() -> String? {
++    /// Cancel (HRESULT_CANCELLED) is terminal; only genuine failures fall back.
++    private static func chooseDirectoryModern() -> FolderPickerOutcome {
+@@ -117 +129 @@
+-      guard hrCreate == 0, let dialog else { return nil }
++      guard hrCreate == 0, let dialog else { return .failed }
+@@ -136 +148,3 @@
+-      guard hrShow == 0 else { return nil }
++      // HRESULT_FROM_WIN32(ERROR_CANCELLED=1223) = 0x800704C7: user cancelled.
++      if hrShow == HRESULT(bitPattern: 0x8007_04C7) { return .cancelled }
++      guard hrShow == 0 else { return .failed }
+@@ -138 +152 @@
+-      guard folderPickerGetResult(dialog, &result) == 0, let result else { return nil }
++      guard folderPickerGetResult(dialog, &result) == 0, let result else { return .failed }
+@@ -140 +154,2 @@
+-      return shellItemFilePath(result)
++      guard let path = shellItemFilePath(result) else { return .failed }
++      return .selected(path)
