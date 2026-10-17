@@ -1,0 +1,428 @@
+# Codex Bridge Windows x64 portable build.
+#
+# Builds upstream source (Fanch-hui/codex-bridge) with the patches in
+# ./patches applied, then produces the portable ZIP consumed by the fork
+# launcher scripts. The patches are zero-context diffs (-U0, keeps this
+# repository ASCII-only); after applying them the workflow checks every
+# touched file against the blob ids recorded in patches/patched-files.txt.
+#
+# Ported from upstream .github/workflows/windows.yml @ 5cb469c2 with the
+# installer steps (Inno Setup / EXE installer) removed. When upstream's build
+# recipe changes, re-sync the shared steps with that file.
+#
+# Manual dispatch only: the upstream ref is resolved at run time, so every
+# build compiles exactly the upstream commit recorded in BUILD-INFO.json.
+
+name: codex-bridge-portable-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Upstream ref (branch, tag, or commit) to patch and build
+        required: true
+        default: win
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-bridge-portable-build-${{ inputs.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPOSITORY: Fanch-hui/codex-bridge
+  SWIFT_VERSION: 6.3.3
+  TARGET_TRIPLE: x86_64-unknown-windows-msvc
+
+jobs:
+  build:
+    name: build (x64)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout build kit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate upstream ref input
+        shell: pwsh
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          $ref = $env:INPUT_REF
+          if ([string]::IsNullOrWhiteSpace($ref)) { throw "The ref input is empty." }
+          if ($ref -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$') {
+            throw "The ref input contains unsupported characters: $ref"
+          }
+          if ($ref -match '\.\.' -or $ref.Contains('//') -or $ref.EndsWith('/') -or $ref.EndsWith('.')) {
+            throw "The ref input looks malformed: $ref"
+          }
+          Write-Host "Upstream ref: $ref"
+      - name: Checkout upstream source
+        shell: pwsh
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          git -c core.autocrlf=false init upstream
+          git -C upstream config core.autocrlf false
+          git -C upstream remote add origin "https://github.com/$env:UPSTREAM_REPOSITORY.git"
+          git -C upstream fetch --depth 1 origin $env:REF
+          if ($LASTEXITCODE -ne 0) { throw "Failed to fetch upstream ref '$env:REF'." }
+          git -C upstream checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Failed to check out upstream FETCH_HEAD." }
+          $sha = (git -C upstream rev-parse HEAD | Select-Object -First 1).ToString().Trim()
+          Add-Content $env:GITHUB_ENV "UPSTREAM_SHA=$sha"
+          Write-Host "Upstream $env:REF -> $sha"
+      - name: Apply portable patches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $patches = @(Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "patches") -Filter "*.patch" | Sort-Object Name)
+          if ($patches.Count -eq 0) { throw "No patch files found under patches/." }
+          # git apply honors core.autocrlf when writing patched files; pin it
+          # off so the checkout and the patched sources stay byte-identical
+          # to the fork tree. The patches are zero-context (-U0), hence
+          # --unidiff-zero; the manifest check below guards against drift.
+          foreach ($patch in $patches) {
+            git -c core.autocrlf=false -C upstream apply --unidiff-zero --check $patch.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Patch does not apply (upstream drifted?): $($patch.Name)" }
+            git -c core.autocrlf=false -C upstream apply --unidiff-zero $patch.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Failed to apply patch: $($patch.Name)" }
+            Write-Host "Applied $($patch.Name)"
+          }
+          git -C upstream status --short
+          Write-Host "Portable patches applied: $($patches.Count)"
+      - name: Verify patched files against manifest
+        shell: pwsh
+        run: |
+          # Zero-context patches could land at shifted positions if upstream
+          # drifted; compare every touched file against the blob ids that
+          # tools/export-patches.ps1 recorded in patches/patched-files.txt.
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE "patches\patched-files.txt"
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Patch manifest is missing: $manifestPath" }
+          $entries = @(Get-Content -LiteralPath $manifestPath | Where-Object { $_ -and -not $_.TrimStart().StartsWith('#') })
+          if ($entries.Count -eq 0) { throw "Patch manifest is empty: $manifestPath" }
+          foreach ($entry in $entries) {
+            $parts = $entry -split ' ', 2
+            if ($parts.Count -ne 2) { throw "Malformed manifest line: $entry" }
+            $expected = $parts[0].Trim()
+            $relative = $parts[1].Trim()
+            $actualLines = @(git -C upstream hash-object -- $relative)
+            if ($LASTEXITCODE -ne 0 -or $actualLines.Count -eq 0) { throw "git hash-object failed for $relative" }
+            $actual = $actualLines[0].ToString().Trim()
+            if ($actual -ne $expected) {
+              throw "Patched file differs from the recorded blob: $relative (expected $expected, actual $actual). Re-baseline the patches."
+            }
+          }
+          Write-Host "Manifest check OK: $($entries.Count) files match the recorded blob ids"
+      - name: Exclude build directories from Windows Defender
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath (Join-Path $env:GITHUB_WORKSPACE "upstream\Packages")
+          Add-MpPreference -ExclusionPath (Join-Path $env:GITHUB_WORKSPACE "upstream\.build")
+          Add-MpPreference -ExclusionProcess "swift-frontend.exe"
+          Add-MpPreference -ExclusionProcess "swift.exe"
+          Add-MpPreference -ExclusionProcess "clang.exe"
+          Add-MpPreference -ExclusionProcess "lld-link.exe"
+      - name: Restore Swift installer cache
+        id: swift-installer-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/swift-downloads
+          key: windows-swift-installer-v2-${{ env.SWIFT_VERSION }}-${{ runner.arch }}
+      - name: Install Swift toolchain
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\upstream\.github\scripts\setup-windows-swift.ps1" -Version $env:SWIFT_VERSION'
+      - name: Save Swift installer cache
+        if: steps.swift-installer-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/swift-downloads
+          key: ${{ steps.swift-installer-cache.outputs.cache-primary-key }}
+      - name: Prepare WiX runtime extraction tools
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE\upstream\.github\scripts\setup-windows-wix.ps1"'
+      - name: Validate Swift portable runtime
+        shell: pwsh
+        run: |
+          $scriptRoot = Join-Path $env:GITHUB_WORKSPACE "upstream\Scripts"
+          . (Join-Path $scriptRoot "windows-portable-support.ps1")
+          . (Join-Path $scriptRoot "windows-portable-runtime.ps1")
+          $architecture = "x64"
+          $expectedMachine = [UInt16]0x8664
+          $temporaryRoot = Join-Path $env:RUNNER_TEMP ("swift-runtime-" + [Guid]::NewGuid().ToString("N"))
+          try {
+            $modulePath = Resolve-SwiftRuntimeMergeModule $architecture
+            Expand-SwiftRuntimeMergeModule $modulePath $temporaryRoot
+            $swiftCore = @(Get-ChildItem -LiteralPath $temporaryRoot -File -Recurse -Filter "swiftCore.dll")
+            if ($swiftCore.Count -ne 1 -or (Get-PEMachine $swiftCore[0].FullName) -ne $expectedMachine) {
+              throw "Swift runtime merge module did not contain the expected swiftCore.dll."
+            }
+            Write-Host "Validated $modulePath"
+          } finally {
+            if (Test-Path -LiteralPath $temporaryRoot) {
+              Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
+            }
+          }
+      - name: Identify vcpkg cache
+        id: vcpkg-cache-key
+        shell: pwsh
+        run: |
+          $revision = & git -C $env:VCPKG_INSTALLATION_ROOT rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content $env:GITHUB_OUTPUT "revision=$revision"
+          Add-Content $env:GITHUB_OUTPUT "image=$env:ImageVersion"
+          $cachePath = Join-Path $env:GITHUB_WORKSPACE "upstream\.build\ci-cache\vcpkg"
+          New-Item -ItemType Directory -Path $cachePath -Force | Out-Null
+          Add-Content $env:GITHUB_ENV "VCPKG_BINARY_SOURCES=clear;files,$cachePath,readwrite"
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: upstream/.build/ci-cache/vcpkg
+          key: windows-vcpkg-v1-x64-windows-${{ steps.vcpkg-cache-key.outputs.image }}-${{ steps.vcpkg-cache-key.outputs.revision }}
+      - name: Install SQLite via vcpkg (for GRDB)
+        shell: pwsh
+        run: |
+          $triplet = "x64-windows"
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "sqlite3:$triplet"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $archDir = "x64"
+          $vsRoot = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -property installationPath | Select-Object -First 1
+          . "$env:GITHUB_WORKSPACE\upstream\Scripts\windows-build-environment.ps1"
+          $buildEnvironment = Get-WindowsBuildEnvironment -Architecture $archDir
+          $vcpkgRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\$triplet"
+          $vcpkgBin = Join-Path $vcpkgRoot "bin"
+          $includePaths = @((Join-Path $vcpkgRoot "include")) + $buildEnvironment.IncludePaths
+          Add-Content $env:GITHUB_ENV "INCLUDE=$($includePaths -join ';')"
+          $targetLibraryPaths = (@((Join-Path $vcpkgRoot "lib")) + $buildEnvironment.LibraryPaths) -join ";"
+          Add-Content $env:GITHUB_ENV "TARGET_LIBRARY_PATHS=$targetLibraryPaths"
+          . "$env:GITHUB_WORKSPACE\upstream\Scripts\windows-portable-support.ps1"
+          $expectedMachine = [UInt16]0x8664
+          if ((Get-PEMachine (Join-Path $vcpkgBin "sqlite3.dll")) -ne $expectedMachine) {
+            throw "SQLite runtime architecture does not match $archDir."
+          }
+          $vcRedistRoot = Get-ChildItem "$vsRoot\VC\Redist\MSVC" -Directory |
+            Where-Object { $_.Name -match "^[0-9]+(?:\.[0-9]+)+$" } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $vcRedistRoot) { throw "Visual C++ Redistributable files are unavailable." }
+          Add-Content $env:GITHUB_ENV "CODEX_BRIDGE_VC_REDIST_ROOT=$vcRedistRoot"
+          Write-Host "LIB=$targetLibraryPaths"
+          Add-Content $env:GITHUB_ENV "LIB=$targetLibraryPaths"
+          if (-not (Test-Path (Join-Path $vcpkgBin "sqlite3.dll"))) {
+            throw "SQLite runtime is unavailable: $vcpkgBin\sqlite3.dll"
+          }
+          Add-Content $env:GITHUB_PATH $vcpkgBin
+      - name: Save vcpkg binary cache
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: upstream/.build/ci-cache/vcpkg
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+      - name: Compile Windows application resources
+        shell: pwsh
+        run: |
+          $resourceOutput = Join-Path $env:GITHUB_WORKSPACE "upstream\.build\windows-resources\CodexBridgeWindowsApp.res"
+          & "$env:GITHUB_WORKSPACE\upstream\Scripts\compile-windows-resources.ps1" -OutputPath $resourceOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content $env:GITHUB_ENV "CODEX_BRIDGE_WINDOWS_RESOURCE=$resourceOutput"
+      - name: Restore SwiftPM dependency repositories
+        id: swift-dependencies-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: upstream/Packages/BridgeCore/.build/repositories
+          key: windows-swift-repositories-v1-${{ hashFiles('upstream/Packages/BridgeCore/Package.resolved', 'upstream/Vendor/swift-sdk/Package.resolved') }}
+          restore-keys: windows-swift-repositories-v1-
+      - name: Resolve SwiftPM dependencies
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          swift package --package-path Packages/BridgeCore resolve
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Save SwiftPM dependency repositories
+        if: steps.swift-dependencies-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: upstream/Packages/BridgeCore/.build/repositories
+          key: ${{ steps.swift-dependencies-cache.outputs.cache-primary-key }}
+      - name: Build service and Windows shell
+        working-directory: upstream/Packages/BridgeCore
+        shell: pwsh
+        run: |
+          swift --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $targetTriple = $env:TARGET_TRIPLE
+          . "$env:GITHUB_WORKSPACE\upstream\Scripts\windows-swift-arguments.ps1"
+          $swiftArguments = @(Get-WindowsSwiftArguments `
+            -VcpkgInstalledRoot "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows" `
+            -TargetTriple $targetTriple -LibraryPaths ($env:TARGET_LIBRARY_PATHS -split ";"))
+          $buildArguments = @($swiftArguments) + @("-c", "release")
+          swift build @buildArguments --product codex-bridge-windows-app
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          swift build @buildArguments --product codex-bridge-service
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $binPathOutput = & swift build @buildArguments --show-bin-path
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $binPath = ($binPathOutput | Select-Object -Last 1).ToString().Trim()
+          if (-not $binPath) { throw "Swift build output directory was empty." }
+          Add-Content $env:GITHUB_ENV "SWIFT_BIN_PATH=$binPath"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - name: Verify installed Agent CLI contracts
+        shell: pwsh
+        working-directory: upstream
+        timeout-minutes: 10
+        run: |
+          node Scripts/verify-agent-runtime-resources.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node Scripts/verify-agent-runtime-resources.mjs "$env:SWIFT_BIN_PATH"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($piVersion in @("0.87.1", "1.0.3")) {
+            $piRoot = ".build/pi-contract/$piVersion"
+            npm install --prefix $piRoot --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$piVersion"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            node Scripts/verify-pi-cli-contract.mjs $piRoot $piVersion
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          npm install --prefix .build/agent-contract --ignore-scripts --no-audit --no-fund @qodercn-ai/qoderclicn@1.1.64 @qodercn-ai/qodercn-agent-sdk@1.0.50
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          import { execFileSync } from 'node:child_process';
+          import { pathToFileURL } from 'node:url';
+          import path from 'node:path';
+          import { SDKProcessOwner } from '../../Packages/BridgeCore/Sources/BridgeQoderSDK/Resources/QoderHost/process.mjs';
+          const root = path.resolve('.build/agent-contract');
+          const modules = path.join(root, 'node_modules');
+          const cli = path.join(modules, '@qodercn-ai/qoderclicn/bundle/qoderclicn.js');
+          console.log('Qoder CN CLI:', execFileSync(process.execPath, [cli, '--version'], { encoding: 'utf8' }).trim());
+          const sdk = await import(pathToFileURL(path.join(modules, '@qodercn-ai/qodercn-agent-sdk/dist/index.js')));
+          const owner = new SDKProcessOwner();
+          let authRequired = false;
+          let warm;
+          try {
+            warm = await sdk.startup({ initializeTimeoutMs: 30000, options: {
+              auth: sdk.qodercliAuth(), transport: sdk.ProcessTransport.default,
+              executable: process.execPath, pathToQoderCLIExecutable: cli, cwd: root,
+              settingSources: [], tools: [], persistSession: false,
+              spawnQoderCLIProcess: options => owner.spawn(options),
+              onAuthExpired: () => { authRequired = true; },
+            } });
+            console.log('Qoder CN native SDK initialization: passed');
+          } catch (error) {
+            if (!authRequired) throw new Error('Qoder SDK startup failed before authentication was verified');
+            console.log('Qoder CN native SDK reached authentication; inference requires a signed-in account');
+          } finally { if (warm) await warm.close(); await owner.close(); }
+          '@ | Set-Content -LiteralPath .build/agent-contract/verify.mjs -Encoding utf8
+          node .build/agent-contract/verify.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Restore Tunnel helper cache
+        id: tunnel-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: upstream/.build/tunnel-client/x64
+          key: windows-tunnel-v1-x64-${{ hashFiles('upstream/Scripts/stage-windows-tunnel-client.ps1') }}
+      - name: Stage Windows tunnel client
+        shell: pwsh
+        run: |
+          $tunnelClientDir = Join-Path $env:GITHUB_WORKSPACE "upstream\.build\tunnel-client\x64"
+          & "$env:GITHUB_WORKSPACE\upstream\Scripts\stage-windows-tunnel-client.ps1" `
+            -Architecture "x64" `
+            -Destination $tunnelClientDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Save Tunnel helper cache
+        if: steps.tunnel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: upstream/.build/tunnel-client/x64
+          key: ${{ steps.tunnel-cache.outputs.cache-primary-key }}
+      - name: Stage Windows portable package
+        shell: pwsh
+        run: |
+          $targetTriple = $env:TARGET_TRIPLE
+          $portableDir = Join-Path $env:GITHUB_WORKSPACE "upstream\.build\windows-dist\x64"
+          # The helper directory is derived here instead of being forwarded
+          # through GITHUB_ENV, so a package can never be staged without it.
+          $tunnelClientDir = Join-Path $env:GITHUB_WORKSPACE "upstream\.build\tunnel-client\x64"
+          foreach ($required in @("tunnel-client.exe", "tunnel-client.sha256")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $tunnelClientDir $required) -PathType Leaf)) {
+              throw "Staged Tunnel helper is incomplete: $tunnelClientDir\$required"
+            }
+          }
+          $stageArguments = @{
+            BinPath = $env:SWIFT_BIN_PATH
+            OutDir = $portableDir
+            Architecture = "x64"
+            VcpkgTriplet = "x64-windows"
+            TunnelClientDir = $tunnelClientDir
+          }
+          if ($targetTriple) {
+            $stageArguments["TargetTriple"] = $targetTriple
+          }
+          & "$env:GITHUB_WORKSPACE\upstream\Scripts\stage-windows-portable.ps1" @stageArguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Smoke test portable package
+        shell: pwsh
+        run: |
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE "upstream\.build\windows-dist\codex-bridge-windows-x64.zip"
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) { throw "Portable ZIP is missing: $zipPath" }
+          if (-not ('System.IO.Compression.ZipFile' -as [type])) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+          }
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $names = @($archive.Entries | ForEach-Object { $_.FullName -replace '\\', '/' })
+            foreach ($required in @('codex-bridge-windows-app.exe', 'codex-bridge-service.exe', 'BUILD-INFO.json', 'SHA256SUMS.txt')) {
+              if (-not ($names | Where-Object { $_ -eq $required -or $_ -like "*/$required" })) {
+                throw "Portable ZIP is missing $required"
+              }
+            }
+            $infoEntry = $archive.Entries |
+              Where-Object { ($_.FullName -replace '\\', '/') -match '(^|/)BUILD-INFO\.json$' } |
+              Select-Object -First 1
+            $reader = New-Object System.IO.StreamReader($infoEntry.Open())
+            try { $buildInfo = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+            if ($buildInfo.schema -ne 'codex-bridge-windows-portable/v1') {
+              throw "Unexpected BUILD-INFO schema: $($buildInfo.schema)"
+            }
+            if ($env:UPSTREAM_SHA -and $buildInfo.gitCommit -ne $env:UPSTREAM_SHA) {
+              throw "BUILD-INFO gitCommit ($($buildInfo.gitCommit)) does not match upstream $env:UPSTREAM_SHA"
+            }
+            $zipSize = (Get-Item -LiteralPath $zipPath).Length
+            Write-Host ("Smoke OK: {0:N1} MB, {1} files, appVersion={2}, gitCommit={3}" -f ($zipSize / 1MB), $names.Count, $buildInfo.appVersion, $buildInfo.gitCommit)
+          } finally {
+            $archive.Dispose()
+          }
+      - name: Upload Windows portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-bridge-windows-x64
+          path: upstream/.build/windows-dist/codex-bridge-windows-x64.zip
+          retention-days: 30
+          if-no-files-found: error
+      - name: Write job summary
+        if: always()
+        shell: pwsh
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          $sha = $env:UPSTREAM_SHA
+          if (-not $sha) { $sha = '(unknown - upstream checkout did not complete)' }
+          $patchDir = Join-Path $env:GITHUB_WORKSPACE "patches"
+          $patchNames = @()
+          if (Test-Path -LiteralPath $patchDir) {
+            $patchNames = @(Get-ChildItem -LiteralPath $patchDir -Filter "*.patch" | Sort-Object Name | ForEach-Object { $_.Name })
+          }
+          $summary = @(
+            '## Codex Bridge portable build (x64)'
+            ''
+            ('- requested ref: `' + $env:INPUT_REF + '`')
+            ('- upstream commit: `' + $sha + '`')
+            ('- patches applied: ' + $patchNames.Count)
+            ''
+          ) + @($patchNames | ForEach-Object { '- `' + $_ + '`' })
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
