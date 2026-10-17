@@ -80,6 +80,18 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $patches = @(Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE "patches") -Filter "*.patch" | Sort-Object Name)
           if ($patches.Count -eq 0) { throw "No patch files found under patches/." }
+          # Defense in depth: never let a CRLF checkout reach git apply. A
+          # CRLF patch cannot match the LF upstream tree and every hunk with
+          # removed lines fails; insert-only hunks would silently keep CRs.
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          foreach ($patch in $patches) {
+            $text = [IO.File]::ReadAllText($patch.FullName)
+            $normalized = $text.Replace("`r`n", "`n")
+            if ($normalized -ne $text) {
+              [IO.File]::WriteAllText($patch.FullName, $normalized, $utf8NoBom)
+              Write-Host "Normalized to LF: $($patch.Name)"
+            }
+          }
           # git apply honors core.autocrlf when writing patched files; pin it
           # off so the checkout and the patched sources stay byte-identical
           # to the fork tree. The patches are zero-context (-U0), hence
